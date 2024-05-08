@@ -1,0 +1,314 @@
+#Shripushkar Ganesh Krishnan
+
+import pandas
+
+sample_csv = pandas.read_csv('sample_sheet.csv', index_col='name')
+CONDITIONS = set(sample_csv['condition'].tolist())
+REPS = set(sample_csv['replicate'].tolist())
+EXTS = ['1.bt2', '2.bt2', '3.bt2', '4.bt2', 'rev.1.bt2', 'rev.2.bt2']
+
+rule all:
+    input:
+        'results/gencode.vM34.primary_assembly.annotation.gtf',
+        'results/GRCm39.primary_assembly.genome.fa',
+        expand('results/{condition}_{rep}_fastqc.html', condition=CONDITIONS, rep=REPS),
+        'results/fingerprint_plot.png',
+        'results/fingerprint_raw_counts.txt',
+        expand('results/mm_index.{ext}', ext=EXTS),
+        expand('results/{condition}_{rep}.sorted.bam.bai', condition=CONDITIONS, rep=REPS),
+        'results/multiqc_report.html',
+        'results/pearson_correlation_heatmap.png',
+        expand('results/tagdir/{condition}_{replicate}/', condition=CONDITIONS, replicate=REPS),
+        'results/filtered_peaks.bed',
+        'results/annotated_peaks.txt',
+        'results/motifs/',
+        expand('results/IP_{rep}_coverage_plot.pdf', rep=REPS)
+
+rule wget_m39:
+    output:
+        'results/GRCm39.primary_assembly.genome.fa.gz'
+    params:
+        ftp_path = 'https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M34/GRCm39.primary_assembly.genome.fa.gz'
+    shell:
+        'wget -O {output} {params.ftp_path}'
+
+rule unzip:
+    input:
+        'results/GRCm39.primary_assembly.genome.fa.gz'
+    output:
+        'results/GRCm39.primary_assembly.genome.fa'
+    shell:
+        'gunzip -c {input} > {output}'
+
+rule wget_m39_gtf:
+    output:
+        'results/gencode.vM34.primary_assembly.annotation.gtf.gz'
+    params:
+        ftp_path = 'https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M34/gencode.vM34.primary_assembly.annotation.gtf.gz'
+    shell:
+        'wget -O {output} {params.ftp_path}'
+
+rule unzip_gtf:
+    input:
+        'results/gencode.vM34.primary_assembly.annotation.gtf.gz'
+    output:
+        'results/gencode.vM34.primary_assembly.annotation.gtf'
+    shell:
+        """
+        gunzip -c {input} > {output}
+        """
+
+rule bowtie2_build_gencode:
+    output: 'results/mm_index.1.bt2',
+            'results/mm_index.2.bt2',
+            'results/mm_index.3.bt2',
+            'results/mm_index.4.bt2',
+            'results/mm_index.rev.1.bt2',
+            'results/mm_index.rev.2.bt2'
+    threads: 16
+    conda:
+        'envs/bowtie2_env.yml'
+    shell:
+        'bowtie2-build --threads {threads} results/GRCm39.primary_assembly.genome.fa.gz results/mm_index'
+
+rule fastqc:
+    input:
+        'samples/{condition}_{rep}.fastq.gz'
+    output:
+        'results/{condition}_{rep}_fastqc.html'
+    threads: 4
+    conda:
+        'envs/fastqc_env.yml'
+    shell:
+        'fastqc -t {threads} -o results/ {input}'
+
+rule fingerprint_plot:
+    input:
+        expand('results/{condition}_{rep}.sorted.bam', condition=CONDITIONS, rep=REPS)
+    output:
+        fingerprint="results/fingerprint_plot.png",
+        raw_counts="results/fingerprint_raw_counts.txt"
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        """
+        multiBamSummary bins --bamfiles {input} -out {output.raw_counts} &&
+        plotFingerprint -b {input} -o {output.fingerprint} --plotFileFormat png
+        """
+
+rule trimmomatic:
+    input:
+        'samples/{condition}_{rep}.fastq.gz'
+    output:
+        'results/{condition}_{rep}.trimmed.fastq.gz'
+    params:
+        adapters='TruSeq2-SE.fa' 
+    threads: 8
+    conda:
+        'envs/trimmomatic_env.yml'
+    shell:
+        'trimmomatic SE -threads {threads} {input} {output} ILLUMINACLIP:{params.adapters}:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15'
+
+rule bowtie2_align:
+    input:
+        'results/{condition}_{rep}.trimmed.fastq.gz',
+    output:
+        'results/{condition}_{rep}.bam'
+    threads: 16
+    params:
+        'results/mm_index'
+    conda:
+        'envs/bowtie2_env.yml'
+    shell:
+        '''
+        bowtie2 -x {params} -p {threads} -U {input} | samtools view -bS - > {output}
+        '''
+
+rule samtools_sort:
+    input:
+        'results/{condition}_{rep}.bam'
+    output:
+        'results/{condition}_{rep}.sorted.bam'
+    conda:
+        'envs/samtools_env.yml'
+    shell:
+        'samtools sort -@ {threads} -o {output} {input}'
+
+rule samtools_flagstats:
+    input:
+        'results/{condition}_{rep}.sorted.bam'
+    output:
+        'results/{condition}_{rep}.flagstat.txt'
+    conda:
+        'envs/samtools_env.yml'
+    shell:
+        'samtools flagstat {input} > {output}'
+
+rule samtools_idx:
+    input:
+        'results/{condition}_{rep}.sorted.bam'
+    output:
+        'results/{condition}_{rep}.sorted.bam.bai'
+    conda:
+        'envs/samtools_env.yml'
+    shell:
+        'samtools index {input} {output}'
+
+rule multiqc:
+    input:
+        expand('results/{condition}_{rep}.flagstat.txt', condition=CONDITIONS, rep=REPS)
+    output:
+        'results/multiqc_report.html'
+    conda:
+        'envs/multiqc_env.yml'
+    shell:
+        'multiqc results/ -o . -n results/multiqc_report.html'
+
+rule bamCoverage:
+    input:
+        bam='results/{condition}_{rep}.sorted.bam',
+        bai='results/{condition}_{rep}.sorted.bam.bai'
+    output:
+        'results/{condition}_{rep}.bw'
+    threads: 4
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        'bamCoverage -b {input.bam} -o {output} -i {input.bai}'
+
+rule multiBwSummary:
+    input:
+        expand('results/{condition}_{rep}.bw', condition=CONDITIONS, rep=REPS)
+    output:
+        'results/multiBigWigSummary_matrix.npz'
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        'multiBigwigSummary bins -b {input} -o {output}'
+
+rule plotCorrelation:
+    input:
+        "results/multiBigWigSummary_matrix.npz"
+    output:
+        "results/pearson_correlation_heatmap.png"
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        """
+        plotCorrelation --corData {input} --whatToPlot heatmap --corMethod pearson --plotTitle "Pearson Correlation of ChIP-seq Samples" --plotNumbers --colorMap RdYlBu -o {output}
+        """
+
+rule make_tag_dir:
+    input:
+        'results/{condition}_{replicate}.sorted.bam'
+    output:
+        directory('results/tagdir/{condition}_{replicate}/')
+    conda:
+        "envs/homer_env.yml"
+    shell:
+        """
+        makeTagDirectory {output} {input}
+        """
+
+rule findPeaks:
+    input:
+        IP = 'results/tagdir/IP_{rep}/',
+        INP = 'results/tagdir/CTL_{rep}/',
+    output:
+        peaks = 'results/{rep}_peaks.txt'
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        """
+        findPeaks {input.IP} {input.INP} -style factor -o {output.peaks}
+        """
+
+rule convertPeakFiles:
+    input:
+        'results/{replicate}_peaks.txt'
+    output:
+        'results/{replicate}_peaks.bed'
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        """
+        pos2bed.pl {input} > {output}
+        """
+
+rule intersect_peaks:
+    input:
+        peaks1= 'results/rep1_peaks.bed',
+        peaks2= 'results/rep2_peaks.bed'
+    output:
+        'results/reproducible_peaks.bed'
+    conda:
+        "envs/bedtools_env.yml"
+    shell:
+        """
+        bedtools intersect -a {input.peaks1} -b {input.peaks2} > {output}
+        """
+
+rule filter_blacklist:
+    input:
+        'results/reproducible_peaks.bed',
+    output:
+        'results/filtered_peaks.bed'
+    params:
+        'mm10-blacklist.v2.bed'
+    conda:
+        "envs/bedtools_env.yml"
+    shell:
+        """
+        bedtools intersect -a {input} -b {params} -v > {output}
+        """
+
+rule annotate_peaks:
+    input:
+        peaks='results/filtered_peaks.bed',
+        gtf='results/gencode.vM34.primary_assembly.annotation.gtf'
+    output:
+        'results/annotated_peaks.txt'
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        """
+        annotatePeaks.pl {input.peaks} mm10 -gtf {input.gtf} > {output}
+        """
+
+rule motifs:
+    input:
+        'results/reproducible_peaks.bed'
+    output:
+        directory('results/motifs/')
+    params:
+        'results/GRCm39.primary_assembly.genome.fa'
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        'findMotifsGenome.pl {input} {params} {output} -size 200'
+
+rule computeMatrix:
+    input:
+        bw="results/IP_{rep}.bw",
+        bed="results/mm_genes.bed"
+    output:
+        matrix="results/IP_{rep}_matrix.gz"
+    conda:
+        'envs/deeptools_env.yml'
+    threads: 4
+    shell:
+        """
+        computeMatrix scale-regions -S {input.bw} -R {input.bed} --beforeRegionStartLength 2000 --afterRegionStartLength 2000 -o {output.matrix}
+        """
+
+rule plotMatrix:
+    input:
+        matrix="results/IP_{rep}_matrix.gz"
+    output:
+        plot="results/IP_{rep}_coverage_plot.pdf"
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        """
+        plotProfile -m {input.matrix} -out {output.plot}
+        """
